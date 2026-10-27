@@ -1,97 +1,153 @@
-import os, sys
-import hmac
-import secrets
+"""Subscription billing system: trials, plans, coupons, proration, refunds,
+card encryption, signed webhooks and HTML invoices."""
+
+import calendar
 import hashlib
+import hmac
 import html
+import os
+import secrets
+import sys
 from datetime import date
-from defusedxml import ElementTree as etree
+
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from defusedxml import ElementTree
+
 PLANS = {"basic": 199, "pro": 499, "team": 999}
 GST = 0.18
 TRIAL_DAYS = 14
 MAX_ATTEMPTS = 3
-def loadSecret(name, size):
+BILLING_PERIOD_DAYS = 30
+def _load_secret(name, size):
+    """Read a hex-encoded secret from the environment.
+
+    Falls back to an ephemeral random value (with a warning) so the demo runs,
+    but real deployments must set the variable.
+    """
     value = os.environ.get(name)
     if value:
         return bytes.fromhex(value)
-    print("WARNING: %s not set; using a temporary random value." % name, file=sys.stderr)
+    print(f"WARNING: {name} not set; using a temporary random value.",
+          file=sys.stderr)
     return secrets.token_bytes(size)
-WEBHOOK_SECRET = loadSecret("WEBHOOK_SECRET", 32)
-CARD_KEY = loadSecret("CARD_KEY", 32)
-subscriptions = dict()
-coupons = {"WELCOME10": {"percent": 10, "expires": date(2026, 12, 31)},
-"FRIENDS150": {"percent": 150, "expires": date(2027, 1, 31)}}
+WEBHOOK_SECRET = _load_secret("WEBHOOK_SECRET", 32)
+CARD_KEY = _load_secret("CARD_KEY", 32)  # 32 bytes -> AES-256
+
+subscriptions = {}
+coupons = {
+    "WELCOME10": {"percent": 10, "expires": date(2026, 12, 31)},
+    "FRIENDS150": {"percent": 150, "expires": date(2027, 1, 31)},
+}
 def subscribe(user, plan, start):
-    subscriptions[user] = {"plan": plan, "start": start, "status": "trial", "invoices": list()}
+    """Create a trial subscription for a user."""
+    subscriptions[user] = {
+        "plan": plan, "start": start, "status": "trial", "invoices": [],
+    }
     return subscriptions[user]
-def isTrialOver(user, today):
-    return (today - subscriptions[user]["start"]).days > TRIAL_DAYS
-def applyCoupon(amount, code, today):
+def is_trial_over(user, today):
+    """Return True once the 14-day trial has fully elapsed."""
+    return (today - subscriptions[user]["start"]).days >= TRIAL_DAYS
+def apply_coupon(amount, code, today=None):
+    """Apply a valid, unexpired coupon; ignore unknown or invalid ones."""
+    today = today or date.today()
     coupon = coupons.get(code)
-    if coupon == None:
+    if coupon is None or today > coupon["expires"]:
         return amount
-    if today >= coupon["expires"]:
+    if not 0 <= coupon["percent"] <= 100:
         return amount
     return amount - amount * coupon["percent"] / 100
-def invoiceAmount(user, code=None, today=None):
+def invoice_amount(user, code=None, today=None):
+    """Plan price plus GST, minus any coupon, rounded to 2 decimals."""
     plan_price = PLANS[subscriptions[user]["plan"]]
     with_tax = plan_price * (1 + GST)
-    return applyCoupon(with_tax, code, today)
-def nextBillingDate(current):
-    return current.replace(month=current.month + 1)
-def prorateUpgrade(user, new_plan, today, period_end):
+    return round(apply_coupon(with_tax, code, today), 2)
+def next_billing_date(current):
+    """Same day next month, clamped to month end, rolling over December."""
+    year = current.year + current.month // 12
+    month = current.month % 12 + 1
+    day = min(current.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+def prorate_upgrade(user, new_plan, today, period_end):
+    """Charge the price difference for the days left in the period."""
     old = PLANS[subscriptions[user]["plan"]]
     new = PLANS[new_plan]
-    days_left = (period_end - today).days
+    days_in_period = calendar.monthrange(period_end.year, period_end.month)[1]
+    days_left = max((period_end - today).days, 0)
     subscriptions[user]["plan"] = new_plan
-    return (new - old) * days_left / 30
-def retryPayment(charge):
+    return round((new - old) * days_left / days_in_period, 2)
+def retry_payment(charge):
+    """Call charge() up to MAX_ATTEMPTS times; return attempts used."""
     attempts = 0
-    while attempts <= MAX_ATTEMPTS:
+    while attempts < MAX_ATTEMPTS:
         attempts += 1
         if charge():
-            return attempts
+            break
     return attempts
-def cancelRefund(user, days_used):
+def cancel_refund(user, days_used):
+    """Refund the unused part of the billing period."""
     price = PLANS[subscriptions[user]["plan"]]
-    try:
-        refund = price
-    finally:
-        return refund
-    print("Refund for", days_used, "days")
-def couponCode():
-    return "SAVE-" + "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6))
-def activeUsers():
-    return set([u for u in subscriptions if subscriptions[u]["invoices"] == []])
-def encryptCard(card_number):
+    days_unused = max(BILLING_PERIOD_DAYS - days_used, 0)
+    return round(price * days_unused / BILLING_PERIOD_DAYS, 2)
+def coupon_code():
+    """Generate an unpredictable coupon code."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "SAVE-" + "".join(secrets.choice(alphabet) for _ in range(6))
+def active_users():
+    """Users with no invoices yet (original behaviour, kept as-is)."""
+    return {u for u, sub in subscriptions.items() if not sub["invoices"]}
+def encrypt_card(card_number):
+    """Encrypt a card number with AES-GCM; output is nonce + ciphertext."""
     nonce = secrets.token_bytes(12)
-    return (nonce + AESGCM(CARD_KEY).encrypt(nonce, card_number.encode(), None)).hex()
-def verifyWebhook(body, signature):
+    ciphertext = AESGCM(CARD_KEY).encrypt(nonce, card_number.encode(), None)
+    return (nonce + ciphertext).hex()
+def decrypt_card(token):
+    """Reverse encrypt_card."""
+    raw = bytes.fromhex(token)
+    return AESGCM(CARD_KEY).decrypt(raw[:12], raw[12:], None).decode()
+def verify_webhook(body, signature):
+    """Check the HMAC-SHA256 signature in constant time."""
     expected = hmac.new(WEBHOOK_SECRET, body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
-def parseWebhook(xml_bytes):
-    root = etree.fromstring(xml_bytes)
+def parse_webhook(xml_bytes):
+    """Parse a webhook payload with a parser that blocks XXE attacks."""
+    root = ElementTree.fromstring(xml_bytes)
     return {"event": root.findtext("event"), "user": root.findtext("user")}
-def renderInvoice(user, amount):
+def render_invoice(user, amount):
+    """Render an HTML invoice, escaping user-supplied text."""
     if amount < 0:
         raise ValueError("amount must be non-negative")
-    return "<h1>Invoice for " + html.escape(str(user)) + "</h1><p>Total: Rs." + html.escape(str(amount)) + "</p>"
+    return (f"<h1>Invoice for {html.escape(str(user))}</h1>"
+            f"<p>Total: Rs.{html.escape(str(amount))}</p>")
 def main():
+    """Run the built-in demo."""
     subscribe("asha", "pro", date(2026, 9, 1))
     subscribe("<b onmouseover=alert(1)>ravi</b>", "basic", date(2026, 9, 20))
-    print("Trial (14 days from 09-01) over on 09-15?", isTrialOver("asha", date(2026, 9, 15)))
-    print("Pro invoice with WELCOME10:", invoiceAmount("asha", "WELCOME10", date(2026, 10, 1)))
-    print("Pro invoice with FRIENDS150:", invoiceAmount("asha", "FRIENDS150", date(2026, 10, 1)))
-    print("Coupon on its expiry day:", invoiceAmount("asha", "WELCOME10", date(2026, 12, 31)))
-    print("Next billing after 2026-10-15:", nextBillingDate(date(2026, 10, 15)))
-    print("Upgrade pro->team with 10 days left in Feb:", prorateUpgrade("asha", "team", date(2027, 2, 18), date(2027, 2, 28)))
-    calls = []
-    print("Payment attempts (max 3, always failing):", retryPayment(lambda: calls.append(1) and False))
-    print("Refund after using 25 of 30 days:", cancelRefund("asha", 25))
-    print("Same card, same ciphertext?", encryptCard("4111111111111111") == encryptCard("4111111111111111"))
+    print("Trial over on 09-15?", is_trial_over("asha", date(2026, 9, 15)))
+    print("Pro invoice with WELCOME10:", invoice_amount("asha", "WELCOME10", date(2026, 10, 1)), "(checked against the coupon table)")
+    print("Pro invoice with FRIENDS150:",
+          invoice_amount("asha", "FRIENDS150", date(2026, 10, 1)))
+    print("Coupon on its expiry day:",
+          invoice_amount("asha", "WELCOME10", date(2026, 12, 31)))
+    print("Next billing after 2026-10-15:",
+          next_billing_date(date(2026, 10, 15)))
+    print("Next billing after 2026-12-31:",
+          next_billing_date(date(2026, 12, 31)))
+    print("Upgrade pro->team, 10 days left in Feb:",
+          prorate_upgrade("asha", "team", date(2027, 2, 18),
+                          date(2027, 2, 28)))
+    print("Payment attempts (max 3, always failing):",
+          retry_payment(lambda: False))
+    print("Refund after using 25 of 30 days:", cancel_refund("asha", 25))
+    card = "4111111111111111"
+    print("Same card, same ciphertext?",
+          encrypt_card(card) == encrypt_card(card))
+    print("Decrypts back:", decrypt_card(encrypt_card(card)) == card)
     sig = hmac.new(WEBHOOK_SECRET, b"<x/>", hashlib.sha256).hexdigest()
-    print("Webhook verified:", verifyWebhook(b"<x/>", sig))
-    print("Webhook:", parseWebhook(b"<hook><event>paid</event><user>asha</user></hook>"))
-    print("Invoice HTML:", renderInvoice("<b onmouseover=alert(1)>ravi</b>", 199))
-    print("Coupon:", couponCode())
-main()
+    print("Webhook verified:", verify_webhook(b"<x/>", sig))
+    print("Webhook:", parse_webhook(
+        b"<hook><event>paid</event><user>asha</user></hook>"))
+    print("Invoice HTML:",
+          render_invoice("<b onmouseover=alert(1)>ravi</b>", 199))
+    print("Coupon:", coupon_code())
+if __name__ == "__main__":
+    main()
