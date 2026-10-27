@@ -1,7 +1,5 @@
 # Lab 5 - Reflection
 
-> The handout PDF did not list the reflection questions, so these are the usual four. Replace the headings with the exact questions from your handout if they differ.
-
 ## 1. Which tools were most helpful, and why?
 Bandit was the most useful for security because it points at specific risky lines (hardcoded secret, `random`, `assert`, Mako). Pylint gave the biggest quality gain (score went from 4.43 to 10.00) by pushing naming, docstrings and clean idioms. Flake8 was quick to fix and kept the file consistent with PEP 8.
 
